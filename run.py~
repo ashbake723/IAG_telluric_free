@@ -1,0 +1,397 @@
+# Store all fxns for fitting lines here
+# 3/21 notes
+"""
+some lines look like they could be shifted. need to check that the fits are
+converging to some extent.
+next step to average telluric subtracted data together, then fit for the stellar
+compont with my spline
+
+then can use that fit to refit the data if i want..
+
+could change to hartmann for strongest lines or fit the residuals 
+in a round 2 potentially but might not be worth it
+
+talk to cullen for what the goal is.. if the goal is to extract a solar spectrum
+that is better than kurucz, then need some metric to show that it is better
+I will have to smudge over saturate tellurics.. can show it's better where tellurics
+aren't saturated?
+
+Can fit the stellar subtracted data with molec fit and terraspec. Can identify lines
+that are troublesome and deviate a lot.
+
+So main question is how far do we go with the fits?? What's our purpose?
+"""
+
+import astropy.io.fits as fits
+import matplotlib.pylab as plt
+import numpy as np
+import scipy.optimize as opt
+ 
+from joblib import Parallel, delayed
+import lmfit
+
+import data as data_class
+import model as model_class
+from utils import * 
+import time,sys
+import pickle
+
+#################################################
+###### STRT USER INPUT ARGUMENTS ##############
+
+nload = None
+output_path = '../outputs/'
+
+if len(sys.argv) > 1:
+	inight = int(sys.argv[1]) - 1  # subtract 1 bc 0 isnt valid job id
+	iv_lim = int(sys.argv[2]) - 1 
+else:
+	inight = 0  # range: 0-22 (23 nights)
+	iv_lim = 492 # range: 0 - 1097 (1098 10 cm-1 ranges)
+
+####### END USER INPUT ARGUMENTS ##############
+#################################################
+def check_fit(result):
+	"""
+	Extract fit params and histogram to see if edges are near bounds
+	"""
+	p = result.params
+	mol = 'H2O'
+	nfit = len(mod.istr[mol])
+	nweak = len(mod.iwk[mol])
+	# line fits
+	nu_fit_arr  = np.array([p['nu_fit_%s_%s'%(mol,i)] for i in range(nfit)])
+	gam_fit_arr = np.array([p['gam_fit_%s_%s'%(mol,i)] for i in range(nfit)])
+	S_fit_arr   = np.array([p['S_fit_%s_%s'%(mol,i)] for i in range(nfit)])
+	nu_wk_arr  = np.array([p['nu_wk_%s_%s'%(mol,i)] for i in range(nweak)])
+	gam_wk_arr = np.array([p['gam_wk_%s_%s'%(mol,i)] for i in range(nweak)])
+	S_wk_arr   = np.array([p['S_wk_%s_%s'%(mol,i)] for i in range(nweak)])
+
+	rvshifts = np.array([p['rv_%s'%i] for i in mod.specnums])
+	coeffs   = np.array([p['coeff_%s'%i] for i in range(len(mod.knots))])
+
+	plt.hist(S_fit_arr)
+	vals, mins, maxs = [], [], []
+	for key in p.keys:
+		vals.append(p[key].value)
+		mins.append(p[key].min)
+		maxs.append(p[key].max)
+
+def set_params(mod,dat,rv=True,tau=True,cont=True,strong=True,weak=False,coeff=False):
+	params = lmfit.Parameters()
+
+	### LINE PARAMETERS
+	params.add('pres',     value=1.0, min=0.2, max=1.1)
+
+	for mol in mod.species:
+		params.add('gam_factor_%s' %mol, value=0.8, min=0.5, max=.9)
+
+		for i in range(len(mod.istr[mol])): # Loop through # of strong lines
+			if strong==True:
+				params.add('nu_fit_%s_%s'%(mol,i),  value = 0.0, min=-1.0e-5, max=1.e-5)
+				params.add('gam_fit_%s_%s'%(mol,i), value = 1.0, min= 0.8,    max=1.2)
+				params.add('S_fit_%s_%s'%(mol,i),   value = 1.0, min= 0.8,    max=1.2)
+			else:
+				params.add('nu_fit_%s_%s'%(mol,i),  value = 0.0, vary=False)
+				params.add('gam_fit_%s_%s'%(mol,i), value = 1.0, vary=False)
+				params.add('S_fit_%s_%s'%(mol,i),   value = 1.0, vary=False)
+		for i in range(len(mod.iwk[mol])): # Loop through # of strong lines
+			if weak==True:
+				params.add('nu_wk_%s_%s'%(mol,i),  value = 0.0,  min=-1.0e-5, max=1.e-5)
+				params.add('gam_wk_%s_%s'%(mol,i), value = 1.0 , min= 0.8,    max=1.2)
+				params.add('S_wk_%s_%s'%(mol,i),   value = 1.0 , min= 0.8,    max=1.2)
+			else:
+				params.add('nu_wk_%s_%s'%(mol,i),  value = 0.0, vary=False)
+				params.add('gam_wk_%s_%s'%(mol,i), value = 1.0, vary=False)
+				params.add('S_wk_%s_%s'%(mol,i),   value = 1.0, vary=False)
+
+	### CONTINUUM ###
+	if cont == True:
+		params.add('cont_l', value=0, min=-0.01, max=0.01)
+		params.add('cont_r', value=0, min=-0.01, max=0.01)
+	else:
+		params.add('cont_l', value=0, vary=False) 
+		params.add('cont_r', value=0, vary=False) 
+
+	### RV ###
+	for i,specnum in enumerate(mod.specnums): # have specnum labels
+		rv_val = np.log(1 - (mod.vel[i]-0.6)/mod.c) 
+		if rv:
+			params.add('rv_%s' %specnum, value=rv_val, min=rv_val - 1e-6, max=rv_val + 1e-6)
+		else:
+			params.add('rv_%s' %specnum, value=rv_val,vary=False)
+
+	### TAU ###
+	for i,specnum in enumerate(mod.specnums): # have specnum labels
+		if i == 0:  # dont vary first tau
+			params.add('tau_%s' %specnum, value=mod.tau[i],vary=False)
+		else:
+			if tau:
+				params.add('tau_%s' %specnum, value=mod.tau[i], min=0.1, max=5.0)
+			else: 
+				params.add('tau_%s' %specnum,value=mod.tau[i],vary=False)
+
+	### COLUMN DENSITIES ####
+	for i,mol in enumerate(mod.species):
+		logCD = np.log10(mod.column_densities[i]) # one CD per species so only need tau for water
+		if mol =='H2O':
+			logCD = dat.CD_H2O
+		params.add('CD_%s' %mol, value = logCD, min = logCD - 1.0, max = logCD + 1.0)
+
+	#### SPLINE COEFFICIENTS FOR STELLAR ####
+	for i,knot in enumerate(mod.knots): # have specnum labels
+		if coeff:
+			params.add('coeff_%s' %i, value=0.01, min=0.0, max=0.5)
+		else:
+			params.add('coeff_%s' %i, value=0.01,vary=False)
+
+	return params
+
+
+def redo_params(params,rv=True,tau=True,cont=True,strong=True,weak=False,CD=True,coeff=False):
+	"""
+	Take params and 
+	"""
+	params_new = lmfit.Parameters()
+
+	params_new.add('pres',     value=params['pres'].value, vary=False)
+
+	### LINE PARAMETERS
+	# Split up into two bc otherwise takes too long
+	for mol in mod.species:
+		params_new.add('gam_factor_%s' %mol, value=params['gam_factor_%s' %mol].value, vary=False)#min=0.5, max=.9)
+		for i in range(len(mod.istr[mol])): # Loop through # of strong lines
+			if strong==True:
+				params_new.add('nu_fit_%s_%s'%(mol,i),  value = params['nu_fit_%s_%s'%(mol,i)].value,  min=-1.0e-5, max=1.e-5)
+				params_new.add('gam_fit_%s_%s'%(mol,i), value = params['gam_fit_%s_%s'%(mol,i)].value, min= 0.2,    max=2.0)
+				params_new.add('S_fit_%s_%s'%(mol,i),   value = params['S_fit_%s_%s'%(mol,i)].value,   min= 0.2,    max=1.5)
+			else:
+				params_new.add('nu_fit_%s_%s'%(mol,i),  value = params['nu_fit_%s_%s'%(mol,i)].value, vary=False)
+				params_new.add('gam_fit_%s_%s'%(mol,i), value = params['gam_fit_%s_%s'%(mol,i)].value, vary=False)
+				params_new.add('S_fit_%s_%s'%(mol,i),   value = params['S_fit_%s_%s'%(mol,i)].value, vary=False)
+		for i in range(len(mod.iwk[mol])): # Loop through # of strong lines
+			if weak==True:
+				params_new.add('nu_wk_%s_%s'%(mol,i),  value = params['nu_wk_%s_%s'%(mol,i)].value,  min=-2.0e-5, max=2.e-5)
+				params_new.add('gam_wk_%s_%s'%(mol,i), value = params['gam_wk_%s_%s'%(mol,i)].value, min= 0.1,    max=2.5)
+				params_new.add('S_wk_%s_%s'%(mol,i),   value = params['S_wk_%s_%s'%(mol,i)].value,   min= 0.1,    max=2.5)
+			else:
+				params_new.add('nu_wk_%s_%s'%(mol,i),  value = params['nu_wk_%s_%s'%(mol,i)].value, vary=False)
+				params_new.add('gam_wk_%s_%s'%(mol,i), value = params['gam_wk_%s_%s'%(mol,i)].value, vary=False)
+				params_new.add('S_wk_%s_%s'%(mol,i),   value = params['S_wk_%s_%s'%(mol,i)].value, vary=False)
+
+	### CONTINUUM ###
+	if cont == True:
+		params_new.add('cont_l', value=params['cont_l'].value, min=-0.01, max=0.01)
+		params_new.add('cont_r', value=params['cont_r'].value, min=-0.01, max=0.01)
+	else:
+		params_new.add('cont_l', value=params['cont_l'].value, vary=False) 
+		params_new.add('cont_r', value=params['cont_r'].value, vary=False) 
+
+	### RV ###
+	for i,specnum in enumerate(mod.specnums): # have specnum labels
+		rv_val = params['rv_%s' %specnum].value
+		if rv:
+			params_new.add('rv_%s' %specnum, value=rv_val, min=rv_val - 1e-6, max=rv_val + 1e-6)
+		else:
+			params_new.add('rv_%s' %specnum, value=rv_val ,vary=False)
+
+	### TAU ###
+	for i,specnum in enumerate(mod.specnums): # have specnum labels
+		if i == 0:  # dont vary first tau
+			params_new.add('tau_%s' %specnum, value=params['tau_%s' %specnum].value,vary=False)
+		else:
+			if tau:
+				params_new.add('tau_%s' %specnum, value=params['tau_%s' %specnum].value, min=0.5, max=1.5)
+			else: 
+				params_new.add('tau_%s' %specnum, value=params['tau_%s' %specnum].value,vary=False)
+
+	### COLUMN DENSITIES ####
+	for i,mol in enumerate(mod.species):
+		if CD==True:
+			params_new.add('CD_%s' %mol, value = params['CD_%s' %mol].value, min =  params['CD_%s' %mol].min, max = params['CD_%s' %mol].max)
+		else:
+			params_new.add('CD_%s' %mol, value = params['CD_%s' %mol].value, vary=False)
+
+	#### SPLINE COEFFICIENTS FOR STELLAR ####
+	for i,knot in enumerate(mod.knots): # have specnum labels
+		if coeff:
+			params_new.add('coeff_%s' %i, value=params['coeff_%s' %i].value, min=params['coeff_%s' %i].min, max=params['coeff_%s' %i].max)
+		else: 
+			params_new.add('coeff_%s' %i, value=params['coeff_%s' %i].value,vary=False)
+
+	return params_new
+
+		
+def minimizing_function(params,mod,s,stel_type='Kurucz'):
+	"""
+	define function
+	"""
+	# Reset param array based on pararr
+	mod.continuum(params)
+		
+	# Define solar
+	mod.solar(params,type=stel_type)
+		
+	# Define telluric
+	mod.telluric(params)
+
+	# define model
+	model = mod.iod_arr + mod.tel_arr + mod.stell_arr + mod.cont_arr + mod.iod_arr
+
+	# Minimization
+	return (model - mod.s_arr)/np.sqrt(mod.unc_arr2)
+
+
+
+def run_fit(fxn,p,mod,stel_type='Kurucz',maxfunevals=300):
+	"""
+	Inputs 
+	------
+	fxn - function to minimize
+	p   - parameters to optimize
+
+	Outputs
+	------
+	result - return object from lmfit
+	model  - 
+
+	"""
+	m = lmfit.Minimizer(fxn, p, 
+			fcn_args=(mod,0,stel_type),calc_covar=False)
+
+	result = m.minimize(method='ampgo',local='SLSQP',maxfunevals=maxfunevals,glbtol=1e-7)	
+	#result = m.minimize(method='emcee')
+	#lmfit.report_fit(result)
+	print 'reduced chi 2 = %s' %result.redchi
+
+	# Redefine final model
+	mod.continuum(result.params)
+	mod.solar(result.params,type=stel_type)
+	mod.telluric(result.params)
+	model = mod.stell_arr + mod.tel_arr + mod.cont_arr + mod.iod_arr
+
+	return result, model
+
+
+def plot_fit(mod,model,night,savename):
+	"""
+	make some plots
+	"""
+	plt.figure()
+	for i in range(mod.nspec):
+		plt.plot(mod.v,mod.s_arr[i])
+		plt.plot(mod.v,model[i],'k--')
+		plt.plot(mod.v,model[i] - mod.s_arr[i],'r')
+
+	plt.xlabel('Wavenumber (cm$^{-1}$)')
+	plt.ylabel('Log Normalized Flux')
+	plt.title(night)
+
+	# Plot where weak lines
+	for mol in mod.species:
+		nus = np.array(mod.hitran_params[mol]['nu'])
+		plt.plot(nus[mod.istr[mol]], np.zeros(len(mod.istr[mol])) - 0.03,'s')
+		plt.plot(nus[mod.iwk[mol]], np.zeros(len(mod.iwk[mol])) - 0.03,'*')
+
+	plt.savefig(output_path + 'plots/%s.pdf' %savename)
+
+def save_fit(result,savename):
+	"""
+	Save fit file
+	"""
+	# Save fit parameters
+	pickle_out = open(output_path + 'params/' + savename + '.pickle',"wb")
+	pickle.dump(result.params, pickle_out)
+	pickle_out.close()
+
+def save_data(p,mod,savename):
+	"""
+	Save stuff from data
+	p: final parameters
+	mod, dat are loaded model and data classes
+	"""
+	taus = np.array([p['tau_%s'%i] for i in mod.specnums])
+	vels = np.array([p['rv_%s'%i] for i in mod.specnums])
+
+	f =  open(output_path + 'supplementary/%s.txt' %savename,'w')
+
+	f.write('# supplementary data outputs for night '+ night + '\n')
+	f.write('# hitran sub data file: %s\n' %mod.subhitfile)
+	f.write('# threshhold values: %s\n' %mod.fit_threshholds)
+
+	f.write('# specnum time airmass taus vels\n')
+	for i,specnum in enumerate(mod.specnums):
+		f.write('%s %s %s %s %s\n' %(specnum, mod.time[i], mod.airmass[i], taus[i], vels[i]))
+
+	f.close()
+
+if __name__=='__main__':
+	night_list, v_lims = define_stuff()
+
+	# Load data, pick data path and calibration file
+	night  = night_list[inight]
+	v0, vf = v_lims[iv_lim]
+	print 'Starting Fits for Night %s in range %s to %s cm-1' %(night,v0,vf)
+
+	savename = 'night_%s_v0_%s_vf_%s' %(night,int(v0),int(vf))
+
+	# Name paths to input files
+	datapath = '../inputs/FTS/%s/' %night
+	cal_file = '../inputs/PREFITS/test_%s.txt' %night
+	tau_file = '../inputs/TAU/tau_%s.txt'   %night
+	
+	# Load Data and Model
+	dat = data_class.data(datapath,cal_file,tau_file,v0=v0,vf=vf,nload=nload)
+	mod = model_class.model(dat,v0,vf)
+
+	# ##################
+	## FIT SEQUENCE ##
+	####################
+
+	# optimize CD and pres and gam
+	p_start      = set_params(mod,dat,rv=False,tau=False,cont=False,strong=False,weak=False,coeff=False)
+	result,model = run_fit(minimizing_function,p_start,mod,maxfunevals=300,stel_type = 'Kurucz')
+
+	params_new    = redo_params(result.params,rv=False,tau=False,cont=True,strong=False,weak=False,CD=False,coeff=False)
+	result, model = run_fit(minimizing_function, params_new, mod,stel_type = 'Kurucz')
+
+	# run 2: tau
+	if len(mod.istr['H2O']) > 0:
+		params_new    = redo_params(result.params,rv=False,tau=True,cont=False,strong=False,weak=False,CD=False,coeff=False)
+		result, model = run_fit(minimizing_function, params_new, mod,stel_type = 'Kurucz')
+
+	# Run 3 strong lines
+	if len(mod.istr['H2O']) + len(mod.istr['O2']) > 0:
+		params_new3 = redo_params(result.params,rv=False,tau=False,cont=False,strong=True,weak=False,CD=False)
+		result, model = run_fit(minimizing_function, params_new3,mod)
+
+	# Run 4 weak lines
+	if len(mod.iwk['H2O']) + len(mod.iwk['O2']) > 0:
+		params_new = redo_params(result.params,rv=False,tau=False,cont=False,strong=False,weak=True,CD=False,coeff=False)
+		result4, model = run_fit(minimizing_function, params_new,mod,maxfunevals=100)
+
+	# Run 6
+	params_new = redo_params(result4.params,rv=True,tau=False,cont=False,strong=False,weak=False,CD=False)
+	result5, model = run_fit(minimizing_function, params_new,mod,maxfunevals=300)
+
+	# plot
+	plot_fit(mod,model,night,savename)
+
+	# Switch to Spline
+	# Get starting coeffs
+	mod.get_coeff0()
+	p_spline0 = result5.params
+	for i in range(len(mod.knots)):
+		p_spline0.add('coeff_%s' %i, value=mod.coeffs0[i], min=mod.coeffs0[i]*.8, max=1.2*mod.coeffs0[i])
+
+	params_new = redo_params(p_spline0,rv=False,tau=False,cont=False,strong=False,weak=False,CD=False,coeff=True)
+	result6, model = run_fit(minimizing_function, params_new,mod,maxfunevals=1,stel_type='Spline')
+
+	params_new = redo_params(result6.params,rv=False,tau=False,cont=False,strong=True,weak=False,CD=False,coeff=True)
+	result_final, model = run_fit(minimizing_function, params_new,mod,maxfunevals=100,stel_type='Spline')
+
+	# Save! save at each step and append step to supplementary data
+	save_fit(result_final,savename)
+	save_data(result_final.params,mod,savename)
+
+
